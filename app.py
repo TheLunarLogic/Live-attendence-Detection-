@@ -17,6 +17,32 @@ from datetime import datetime
 import os
 import tempfile
 import shutil
+import platform
+import cv2
+import torch
+import torchvision
+
+# Print startup diagnostics for tracking environment mismatches
+st.cache_resource
+def print_diagnostics():
+    print("=== System Diagnostics ===")
+    print(f"OS: {platform.system()} {platform.release()}")
+    print(f"Python: {platform.python_version()}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"Torchvision: {torchvision.__version__}")
+    print(f"OpenCV: {cv2.__version__}")
+    print(f"NumPy: {np.__version__}")
+    print(f"CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"GPU Device: {torch.cuda.get_device_name(0)}")
+        print(f"Allow TF32 (cuDNN): {torch.backends.cudnn.allow_tf32}")
+        print(f"Allow TF32 (matmul): {torch.backends.cuda.matmul.allow_tf32}")
+        print(f"Deterministic algos: {torch.are_deterministic_algorithms_enabled()}")
+    print("==========================")
+
+# Run once per server start
+print_diagnostics()
 
 # ── Core modules ──────────────────────────────────────────────────────────────
 from database import Database

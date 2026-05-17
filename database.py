@@ -6,8 +6,10 @@ Handles SQLite database operations for classes and students.
 import sqlite3
 import numpy as np
 import json
+import logging
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
+from face_utils import EMBEDDING_PIPELINE_VERSION
 
 
 class Database:
@@ -346,7 +348,7 @@ class Database:
     
     def _serialize_embedding(self, embedding: np.ndarray) -> str:
         """
-        Serialize numpy array to JSON string.
+        Serialize numpy array to JSON string with pipeline version.
         
         Args:
             embedding: Numpy array
@@ -354,11 +356,16 @@ class Database:
         Returns:
             JSON string
         """
-        return json.dumps(embedding.tolist())
+        payload = {
+            "version": EMBEDDING_PIPELINE_VERSION,
+            "data": embedding.tolist()
+        }
+        return json.dumps(payload)
     
     def _deserialize_embedding(self, json_str: str) -> np.ndarray:
         """
         Deserialize JSON string back to numpy array.
+        Handles version checking for embeddings.
         
         Args:
             json_str: JSON string
@@ -366,4 +373,17 @@ class Database:
         Returns:
             Numpy array
         """
-        return np.array(json.loads(json_str), dtype=np.float32)
+        parsed = json.loads(json_str)
+        
+        # Handle legacy v1 format (which was just a direct list)
+        if isinstance(parsed, list):
+            logging.warning("WARNING: Embedding pipeline version mismatch (Legacy v1). Re-registration required for exact determinism.")
+            return np.array(parsed, dtype=np.float32)
+            
+        # Handle new format
+        if isinstance(parsed, dict):
+            if parsed.get("version") != EMBEDDING_PIPELINE_VERSION:
+                logging.warning(f"WARNING: Embedding pipeline version mismatch (Stored: {parsed.get('version')}, Current: {EMBEDDING_PIPELINE_VERSION}). Re-registration required.")
+            return np.array(parsed["data"], dtype=np.float32)
+            
+        raise ValueError("Unknown embedding format in database")

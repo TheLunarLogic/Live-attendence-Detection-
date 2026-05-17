@@ -27,8 +27,8 @@ import time
 import tempfile
 import logging
 import threading
-import queue
-from typing import List, Dict, Set, Tuple, Optional, Callable
+from queue import Queue, Empty
+from typing import List, Dict, Set, Tuple, Optional, Callable, Any
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,7 +37,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from face_utils import normalize_embedding
+from face_utils import crop_face, preprocess_face_for_embedding, normalize_embedding
 from video_debug import DebugSession, DEBUG_MODE
 
 logging.basicConfig(level=logging.INFO)
@@ -199,7 +199,7 @@ class VideoCaptureThread:
         self._cap = cv2.VideoCapture(video_path)
         if not self._cap.isOpened():
             raise IOError(f"Cannot open video: {video_path}")
-        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._queue: Queue = Queue(maxsize=queue_size)
         self._stopped = False
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
@@ -217,7 +217,7 @@ class VideoCaptureThread:
         try:
             frame = self._queue.get(timeout=10.0)
             return frame
-        except queue.Empty:
+        except Empty:
             return None
 
     @property
@@ -249,20 +249,6 @@ def _is_face_large_enough(box: np.ndarray) -> bool:
     return w >= MIN_FACE_SIZE and h >= MIN_FACE_SIZE
 
 
-def _is_face_sharp(frame_rgb: np.ndarray, box: np.ndarray) -> bool:
-    """Reject blurry face crops using Laplacian variance."""
-    x1, y1, x2, y2 = [int(c) for c in box]
-    h, w = frame_rgb.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
-        return False
-    crop = frame_rgb[y1:y2, x1:x2]
-    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-    return variance >= BLUR_THRESHOLD
-
-
 def _compute_avg_face_size(boxes: np.ndarray) -> float:
     """Compute average face bounding box size (mean of width and height)."""
     if boxes is None or len(boxes) == 0:
@@ -270,45 +256,6 @@ def _compute_avg_face_size(boxes: np.ndarray) -> float:
     widths = boxes[:, 2] - boxes[:, 0]
     heights = boxes[:, 3] - boxes[:, 1]
     return float(np.mean((widths + heights) / 2))
-
-
-def _get_adaptive_downscale(avg_face_size: float) -> float:
-    """Select detection downscale factor based on average detected face size."""
-    if avg_face_size > 120:
-        return DOWNSCALE_LARGE_FACE
-    elif avg_face_size > 80:
-        return DOWNSCALE_MEDIUM_FACE
-    else:
-        return DOWNSCALE_SMALL_FACE
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Hybrid detection precheck — lightweight Haar cascade gate
-# ══════════════════════════════════════════════════════════════════════════════
-
-_HAAR_CASCADE = None
-
-def _get_haar_cascade():
-    """Lazy-load the Haar cascade classifier."""
-    global _HAAR_CASCADE
-    if _HAAR_CASCADE is None:
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        _HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
-    return _HAAR_CASCADE
-
-
-def _haar_precheck(frame_rgb: np.ndarray, min_size: int = 30) -> bool:
-    """
-    Fast Haar cascade check — returns True if ANY face candidate is found.
-    Used as a cheap gate before expensive MTCNN inference.
-    Runs on a small grayscale thumbnail for speed (~1-2ms).
-    """
-    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-    small = cv2.resize(gray, (320, 240))
-    cascade = _get_haar_cascade()
-    faces = cascade.detectMultiScale(small, scaleFactor=1.3, minNeighbors=2,
-                                     minSize=(min_size, min_size))
-    return len(faces) > 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -602,30 +549,22 @@ def _detect_faces_fullframe(
 # Embedding extraction — single + batch modes
 # ══════════════════════════════════════════════════════════════════════════════
 
-_FACENET_INPUT_SIZE = 160  # InceptionResnetV1 expected input
-
-
-def _prepare_face_tensor(frame_rgb: np.ndarray, box: np.ndarray) -> Optional[torch.Tensor]:
-    """Crop, resize and normalize a face to a ready-to-infer tensor (no batch dim)."""
+def _prepare_face_tensor_wrapper(frame_bgr: np.ndarray, box: np.ndarray) -> Optional[torch.Tensor]:
+    """Wrapper that calls the centralized preprocessing pipeline."""
     try:
-        x1, y1, x2, y2 = [int(c) for c in box]
-        h, w = frame_rgb.shape[:2]
-        margin = int(max(x2 - x1, y2 - y1) * 0.15)
-        x1m, y1m = max(0, x1 - margin), max(0, y1 - margin)
-        x2m, y2m = min(w, x2 + margin), min(h, y2 + margin)
-        crop = frame_rgb[y1m:y2m, x1m:x2m]
-        if crop.size == 0:
+        face_crop_bgr = crop_face(frame_bgr, box)
+        if face_crop_bgr is None:
             return None
-        face_resized = cv2.resize(crop, (_FACENET_INPUT_SIZE, _FACENET_INPUT_SIZE))
-        face_tensor = torch.from_numpy(face_resized).permute(2, 0, 1).float()
-        face_tensor = (face_tensor - 127.5) / 128.0
-        return face_tensor
+        tensor = preprocess_face_for_embedding(face_crop_bgr)
+        if tensor is not None:
+            return tensor.squeeze(0)
+        return None
     except Exception:
         return None
 
 
 def _batch_extract_embeddings(
-    frame_rgb: np.ndarray,
+    frame_bgr: np.ndarray,
     boxes: List[np.ndarray],
     resnet,
     device,
@@ -640,7 +579,7 @@ def _batch_extract_embeddings(
 
     # Prepare tensors in parallel threads (CPU-bound crop/resize)
     with ThreadPoolExecutor(max_workers=min(max_threads, len(boxes))) as pool:
-        futures = [pool.submit(_prepare_face_tensor, frame_rgb, box) for box in boxes]
+        futures = [pool.submit(_prepare_face_tensor_wrapper, frame_bgr, box) for box in boxes]
         tensors = [f.result() for f in futures]
 
     # Separate valid from failed
@@ -658,25 +597,28 @@ def _batch_extract_embeddings(
         # Scatter results back
         results: List[Optional[np.ndarray]] = [None] * len(boxes)
         for j, orig_idx in enumerate(valid_indices):
-            results[orig_idx] = normalize_embedding(batch_embs[j])
+            # Normalization is now unified through face_utils
+            normed = normalize_embedding(batch_embs[j])
+            results[orig_idx] = normed
         return results
     except Exception as e:
         logger.debug(f"Batch embedding failed, falling back to individual: {e}")
         results = [None] * len(boxes)
         for idx in valid_indices:
-            results[idx] = _extract_embedding_for_box(frame_rgb, boxes[idx], resnet, device)
+            results[idx] = _extract_embedding_for_box(frame_bgr, boxes[idx], resnet, device)
         return results
 
 
 def _extract_embedding_for_box(
-    frame_rgb: np.ndarray,
+    frame_bgr: np.ndarray,
     box: np.ndarray,
     resnet,
     device,
 ) -> Optional[np.ndarray]:
     """Single-face embedding extraction (fallback for batch failures)."""
     try:
-        t = _prepare_face_tensor(frame_rgb, box)
+        # Re-use centralized prep wrapper
+        t = _prepare_face_tensor_wrapper(frame_bgr, box)
         if t is None:
             return None
         t = t.unsqueeze(0).to(device, non_blocking=True)
@@ -907,7 +849,6 @@ def process_video_for_attendance(
         processed += 1
         video_stats["processed_frames"] = processed
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        del frame_bgr
 
         # ── Motion pre-filter: skip near-static frames ──
         if motion_threshold > 0:
@@ -925,7 +866,6 @@ def process_video_for_attendance(
         dbg.save_raw_frame(frame_rgb, frame_idx)
 
         # ── Build detection frame (upscale then optionally downscale) ──
-        # Upscale improves small-face detectability without degrading embedding crops
         h_orig, w_orig = frame_rgb.shape[:2]
         if UPSCALE_FACTOR != 1.0:
             detect_base = cv2.resize(
@@ -947,7 +887,7 @@ def process_video_for_attendance(
         t_det = time.perf_counter()
 
         if run_full_detection:
-            # MTCNN is the primary detector — NO precheck gate
+            # MTCNN is the primary detector
             if use_grid_detection:
                 boxes, probs = _detect_faces_grid(detect_frame, mtcnn)
             else:
@@ -981,7 +921,7 @@ def process_video_for_attendance(
             prof.frame_done()
             continue
 
-        # ── Multi-level quality filtering (replaces binary blur rejection) ──
+        # ── Multi-level quality filtering ──
         quality_mask = []       # indices of faces that pass (high + low quality)
         face_quality = {}       # idx → {"tier": "high"|"low", "weight": float, "blur": float}
         blur_rej = 0
@@ -1011,22 +951,18 @@ def process_video_for_attendance(
 
             # Multi-level blur decision
             if blur_var < BLUR_HARD_REJECT:
-                # Completely unusable
                 blur_rej += 1
                 prof.count("skipped_by_blur")
                 logger.debug(f"  Face {i}: HARD REJECT (blur={blur_var:.1f} < {BLUR_HARD_REJECT})")
                 continue
             elif blur_var < BLUR_LOW_QUALITY:
-                # Low quality — allow but with reduced vote weight
                 face_quality[i] = {"tier": "low", "weight": VOTE_WEIGHT_LOW, "blur": blur_var}
                 prof.count("faces_low_quality")
             else:
-                # High quality
                 face_quality[i] = {"tier": "high", "weight": VOTE_WEIGHT_HIGH, "blur": blur_var}
                 prof.count("faces_high_quality")
             quality_mask.append(i)
 
-        # Track detection statistics
         prof.count("total_faces_raw", len(boxes))
         prof.count("total_faces_passed", len(quality_mask))
         prof.count("total_blur_rejected", blur_rej)
@@ -1037,7 +973,7 @@ def process_video_for_attendance(
         if run_full_detection:
             dbg.save_detection_frame(detect_frame if ds == 1.0 else frame_rgb, frame_idx, boxes, probs)
 
-        # ── Debug frame export with annotations ──
+        # ── Debug frame export ──
         if SAVE_DEBUG_FRAMES and processed % DEBUG_FRAME_SAMPLE_RATE == 0:
             _save_debug_frame(frame_rgb, frame_idx, boxes, quality_mask,
                               blur_scores, face_sizes, probs)
@@ -1051,23 +987,18 @@ def process_video_for_attendance(
             continue
 
         good_boxes = boxes[quality_mask]
-        # Map each good_box to its quality weight (from multi-level blur scoring)
         box_quality_weights = [face_quality[qi]["weight"] for qi in quality_mask]
         video_stats["faces_detected_total"] += len(good_boxes)
 
         for fi, box in enumerate(good_boxes):
             dbg.save_crop(frame_rgb, box, frame_idx, fi)
 
-        logger.debug(f"Frame {frame_idx}: {len(good_boxes)} quality faces detected")
-
         # ── Tracking ──
         tracked = tracker.update(good_boxes, frame_idx)
 
         # Map tracked boxes to quality weights
-        # tracked[i] corresponds to good_boxes ordering, build box→weight lookup
         track_quality_weights = {}
         for t_idx, (track_id, box, _) in enumerate(tracked):
-            # Find which good_box this track matched to (by centroid proximity)
             best_match_idx = 0
             if len(good_boxes) > 1:
                 cx, cy = (box[0]+box[2])/2, (box[1]+box[3])/2
@@ -1075,12 +1006,11 @@ def process_video_for_attendance(
                 best_match_idx = int(np.argmin(dists))
             track_quality_weights[track_id] = box_quality_weights[min(best_match_idx, len(box_quality_weights)-1)]
 
-        # ── Batch embedding: collect faces that need extraction ──
+        # ── Batch embedding ──
         faces_to_embed = []  # (track_id, box)
         cached_results = []  # (track_id, box, embedding, weight)
         for track_id, box, needs_recognition in tracked:
-            dbg.log_track(frame_idx, track_id, needs_recognition,
-                          reason="cooldown" if not needs_recognition else "")
+            dbg.log_track(frame_idx, track_id, needs_recognition)
             if not needs_recognition:
                 continue
             weight = track_quality_weights.get(track_id, VOTE_WEIGHT_HIGH)
@@ -1092,17 +1022,13 @@ def process_video_for_attendance(
                 faces_to_embed.append((track_id, box, weight))
                 prof.count("emb_cache_misses")
 
-        # Batch extract new embeddings
         t_emb = time.perf_counter()
         new_embeddings = []
         if faces_to_embed:
             embed_boxes = [item[1] for item in faces_to_embed]
-            new_embeddings = _batch_extract_embeddings(frame_rgb, embed_boxes, resnet, device,
-                                                       max_threads=prep_threads)
+            new_embeddings = _batch_extract_embeddings(frame_bgr, embed_boxes, resnet, device, max_threads=prep_threads)
         prof.tick("embedding", (time.perf_counter() - t_emb) * 1000)
 
-        # Combine cached + fresh embeddings into recognition list
-        # Each entry: (track_id, box, embedding, vote_weight)
         recognition_list = []
         for (tid, bx, wt), emb in zip(faces_to_embed, new_embeddings):
             if emb is not None:
